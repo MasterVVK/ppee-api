@@ -7,6 +7,7 @@ import uuid
 import time
 import logging
 import json
+import asyncio
 from typing import Dict, List, Any, Optional, Union
 from datetime import datetime
 
@@ -14,6 +15,7 @@ from datetime import datetime
 from ppee_analyzer.vector_store import QdrantManager, OllamaEmbeddings, BGEReranker
 from ppee_analyzer.document_processor import DoclingPDFConverter, PPEEDocumentSplitter
 from ppee_analyzer.checklist import ChecklistAnalyzer
+from qdrant_client.http import models
 
 # Настройка логирования
 logging.basicConfig(
@@ -811,6 +813,75 @@ async def delete_application(application_id: str):
         raise HTTPException(status_code=500, detail=f"Ошибка при удалении данных: {str(e)}")
 
 
+# Эндпоинт для просмотра чанков заявки
+@app.get("/api/applications/{application_id}/chunks", response_model=Dict[str, Any])
+async def get_application_chunks(application_id: str, limit: int = Query(500, ge=1, le=1000)):
+    """
+    Возвращает чанки документов заявки.
+
+    - **application_id**: ID заявки
+    - **limit**: Максимальное количество возвращаемых чанков
+    """
+    try:
+        # Получаем экземпляр QdrantManager
+        qdrant_manager = get_qdrant_manager()
+
+        # Получаем статистику по заявке
+        stats = qdrant_manager.get_stats(application_id)
+
+        # Получаем все чанки заявки (с ограничением)
+        response = qdrant_manager.client.scroll(
+            collection_name=qdrant_manager.collection_name,
+            scroll_filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="metadata.application_id",
+                        match=models.MatchValue(value=application_id)
+                    )
+                ]
+            ),
+            limit=limit,
+            with_payload=True,
+            with_vectors=False
+        )
+
+        # Преобразуем результаты в более удобный формат
+        chunks = []
+        for point in response[0]:
+            if "payload" in point.__dict__:
+                # Получаем текст
+                text = ""
+                if "page_content" in point.payload:
+                    text = point.payload["page_content"]
+
+                # Получаем метаданные
+                metadata = {}
+                if "metadata" in point.payload:
+                    metadata = point.payload["metadata"]
+
+                # Добавляем в список
+                chunk = {
+                    "id": str(point.id),
+                    "text": text,
+                    "metadata": metadata
+                }
+                chunks.append(chunk)
+
+        # Сортируем чанки по порядку (если есть chunk_index в метаданных)
+        chunks.sort(key=lambda x: x["metadata"].get("chunk_index", 0) if x["metadata"] else 0)
+
+        return {
+            "application_id": application_id,
+            "chunks_count": len(chunks),
+            "stats": stats,
+            "chunks": chunks
+        }
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении чанков заявки {application_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ошибка при получении чанков: {str(e)}")
+
+
 # Обработка ошибок
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
@@ -828,9 +899,6 @@ async def general_exception_handler(request, exc):
         content={"status": "error", "message": f"Внутренняя ошибка сервера: {str(exc)}"}
     )
 
-
-# Импорт asyncio добавляем в конец файла, чтобы избежать проблем с циклическими импортами
-import asyncio
 
 # Запуск приложения
 if __name__ == "__main__":
